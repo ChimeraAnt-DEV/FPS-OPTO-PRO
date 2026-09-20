@@ -623,13 +623,44 @@ void threadShadowsAreIsolated() {
 
 void statisticsCountSuppressions() {
   freshContext();
-  const auto before = gl().stats();
+  fpsopto::GlCounters::instance().reset();
   fpsopto_glEnable(fpsopto::kGlBlend);
   fpsopto_glEnable(fpsopto::kGlBlend); // suppressed
   fpsopto_glViewport(0, 0, 1, 1);
-  const auto after = gl().stats();
-  EXPECT_EQ(after.stateCalls - before.stateCalls, std::uint64_t{3});
-  EXPECT_EQ(after.suppressed - before.suppressed, std::uint64_t{1});
+  fpsopto::GlCounters::instance().publish();
+  const auto after = gl().traffic();
+  EXPECT_EQ(after.total.calls, std::uint64_t{3});
+  EXPECT_EQ(after.total.suppressed, std::uint64_t{1});
+  EXPECT_EQ(after.perHook[static_cast<std::size_t>(fpsopto::GlHook::Enable)].calls,
+            std::uint64_t{2});
+  EXPECT_EQ(
+      after.perHook[static_cast<std::size_t>(fpsopto::GlHook::Enable)].suppressed,
+      std::uint64_t{1});
+  EXPECT_EQ(
+      after.perHook[static_cast<std::size_t>(fpsopto::GlHook::Viewport)].calls,
+      std::uint64_t{1});
+  EXPECT_EQ(after.hooksDisabled, std::uint64_t{0});
+}
+
+// A hook that is switched off forwards its calls without dropping them, but it
+// keeps learning them: the shadow it maintains is read by other hooks, so
+// switching this hook back on must not find it stale.
+void disabledHookForwardsEverything() {
+  auto &interceptor = fpsopto::GlInterceptor::instance();
+  freshContext();
+  interceptor.setHookEnabled(fpsopto::GlHook::Enable, false);
+  EXPECT_EQ(interceptor.traffic().hooksDisabled, std::uint64_t{1});
+
+  fpsopto_glEnable(fpsopto::kGlBlend);
+  fpsopto_glEnable(fpsopto::kGlBlend); // redundant, but the hook is off
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{2});
+
+  interceptor.setHookEnabled(fpsopto::GlHook::Enable, true);
+  EXPECT_EQ(interceptor.traffic().hooksDisabled, std::uint64_t{0});
+  // The hook learned the state while it was off, so the repeated enable is
+  // recognised at once and dropped.
+  fpsopto_glEnable(fpsopto::kGlBlend);
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{2});
 }
 
 } // namespace
@@ -679,4 +710,5 @@ void runGlFilterTests() {
   destroyedContextShadowIsDropped();
   threadShadowsAreIsolated();
   statisticsCountSuppressions();
+  disabledHookForwardsEverything();
 }

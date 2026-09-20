@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "GlCounters.h"
 #include "GlStateModel.h"
 
 namespace fpsopto {
@@ -18,21 +19,6 @@ struct ShadowCache {
   std::uintptr_t handle = 0;
   GlStateModel *state = nullptr;
   TextureUnits *textures = nullptr;
-};
-
-struct GlHookStats {
-  std::uint64_t stateCalls = 0;
-  std::uint64_t suppressed = 0;
-
-  // Share of state calls that never reached the driver. A suppressed call is
-  // cheaper than an issued one, but only the driver can say by how much, so
-  // this is a traffic counter rather than a timing claim.
-  double suppressionRatio() const {
-    if (stateCalls == 0) {
-      return 0.0;
-    }
-    return static_cast<double>(suppressed) / static_cast<double>(stateCalls);
-  }
 };
 
 // Installs detours on the GL ES state entry points and keeps a shadow of the
@@ -48,6 +34,11 @@ struct GlHookStats {
 // Because a thread's current context can be created by another thread, the
 // shadow lookup goes through the EGL current-context query rather than relying
 // on which thread happened to install or reset it.
+//
+// Individual hooks can be switched off at runtime, which is what the auto mode
+// uses when a hook's drop rate does not justify its indirection. A disabled
+// hook is still installed -- removing it mid-frame would race the render
+// thread -- but its detour forwards immediately.
 class GlInterceptor {
 public:
   static GlInterceptor &instance();
@@ -63,14 +54,44 @@ public:
   [[nodiscard]] const std::vector<std::string> &failedHooks() const {
     return mFailedHooks;
   }
+
   // Snapshot of the traffic counters; safe to copy from any thread.
-  [[nodiscard]] GlHookStats stats() const {
-    return GlHookStats{mStateCalls.load(std::memory_order_relaxed),
-                       mSuppressed.load(std::memory_order_relaxed)};
+  [[nodiscard]] GlTrafficSnapshot traffic() const {
+    GlTrafficSnapshot out = GlCounters::instance().snapshot();
+    for (std::size_t i = 0; i < kGlHookCount; ++i) {
+      if (!mHookEnabled[i].load(std::memory_order_relaxed)) {
+        ++out.hooksDisabled;
+      }
+    }
+    return out;
   }
 
-  // Records one call that passed through the filter. Called by the detours.
-  void noteCall(bool suppressed);
+  // Records one call that passed through the filter. Called by the detours, so
+  // it is a plain increment on thread-local storage rather than an atomic.
+  void noteCall(GlHook hook, bool suppressed) {
+    GlCounters::instance().note(hook, suppressed);
+  }
+
+  // Whether a hook is currently allowed to drop a call it recognises. A
+  // disabled hook still updates the shadow -- other hooks read the fields it
+  // maintains -- but forwards every call, so it stops costing the drop path.
+  [[nodiscard]] bool hookEnabled(GlHook hook) const {
+    return mHookEnabled[static_cast<std::size_t>(hook)].load(
+        std::memory_order_relaxed);
+  }
+
+  void setHookEnabled(GlHook hook, bool enabled) {
+    mHookEnabled[static_cast<std::size_t>(hook)].store(
+        enabled, std::memory_order_relaxed);
+  }
+
+  // Turns every hook's filtering off (or back on). Used by safe mode, which
+  // wants the hooks installed but inert rather than absent.
+  void setAllHooksEnabled(bool enabled) {
+    for (std::size_t i = 0; i < kGlHookCount; ++i) {
+      mHookEnabled[i].store(enabled, std::memory_order_relaxed);
+    }
+  }
 
   // The context the calling thread has current, or 0 when none is. Set once at
   // install time from the EGL entry point and called on every filtered state
@@ -97,6 +118,10 @@ public:
   };
   LiveShadow shadow();
 
+  // Test-only: read the raw shadow struct for the current context, so the
+  // drift check and the tests can compare it against real state.
+  [[nodiscard]] const GlStateModel *shadowStateForTest();
+
   // Test-only: route the current-context query to a caller-supplied handle. A
   // handle of 0 restores the single no-context shadow used before any context
   // has been registered.
@@ -112,7 +137,14 @@ private:
     TextureUnits textures{};
   };
 
-  GlInterceptor() = default;
+  GlInterceptor() {
+    // Filtering is on from construction. Whether the hooks are actually in
+    // place is a separate question (`install`), and the policy that switches a
+    // hook off runs after install, so this is the neutral starting point.
+    for (std::size_t i = 0; i < kGlHookCount; ++i) {
+      mHookEnabled[i].store(true, std::memory_order_relaxed);
+    }
+  }
 
   std::uintptr_t currentContext() const {
     if (const CurrentContextFn query =
@@ -143,12 +175,12 @@ private:
   std::mutex mContextMutex;
   std::atomic<std::uint64_t> mContextGeneration{0};
 
+  std::atomic<bool> mHookEnabled[kGlHookCount] = {};
+
   bool mInstalled = false;
   int mInstalledCount = 0;
   int mFailedCount = 0;
   std::vector<std::string> mFailedHooks;
-  std::atomic<std::uint64_t> mStateCalls{0};
-  std::atomic<std::uint64_t> mSuppressed{0};
 };
 
 } // namespace fpsopto
