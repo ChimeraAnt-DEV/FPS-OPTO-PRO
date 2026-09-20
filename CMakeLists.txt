@@ -110,7 +110,9 @@ add_library(fps_opto_pro SHARED
     src/GlInterceptor.cpp
     src/EglSensor.cpp
     src/ThreadScheduler.cpp
-    src/AdpfSession.cpp)
+    src/AdpfSession.cpp
+    src/BootMarker.cpp
+    src/Diagnostics.cpp)
 
 set_target_properties(fps_opto_pro PROPERTIES OUTPUT_NAME "fps_opto_pro")
 fps_opto_pro_configure(fps_opto_pro)
