@@ -1,0 +1,10 @@
+{
+  "type": "preload-native",
+  "name": "FPS-OPTO-PRO",
+  "author": "ChimeraAnt-DEV",
+  "version": "1.0.0",
+  "entry": "libfps_opto_pro.so",
+  "minecraft_versions": [],
+  "overwrite_files": [],
+  "overwrite_folders": []
+}
