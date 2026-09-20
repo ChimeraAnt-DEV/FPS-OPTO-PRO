@@ -1,0 +1,141 @@
+name: build-so
+
+# Builds the native mod (libfps_opto_pro.so) for arm64-v8a.
+#
+# The host-test job is a gate, not a formality: it needs no Android SDK and
+# runs in seconds, so a broken GL shadow or governor rule fails before the
+# expensive cross-compile starts.
+#
+# The preloader SDK is a public repository, but it is pinned to one commit so
+# that a change upstream cannot silently alter what CI produces. Its own
+# FetchContent dependencies (nlohmann_json, boost pfr, magic_enum, fmt,
+# lunasvg) are rebuilt on every run unless FETCHCONTENT_BASE_DIR is cached,
+# which is why that directory is cached below.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-so.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-so.yml'
+  workflow_dispatch:
+  # Reused by build-pack.yml so the packaging job never duplicates this build.
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: r27c
+  ANDROID_ABI: arm64-v8a
+  ANDROID_PLATFORM: android-26
+  PRELOADER_REPO: https://github.com/LiteLDev/preloader-android.git
+  PRELOADER_COMMIT: e0a61cbcc46b7fc84f977958f2bbeac47b6fe856
+
+jobs:
+  host-tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build-host -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-host -j"$(nproc)"
+
+      - name: Run tests
+        run: ./build-host/tests/fps_opto_pro_tests
+
+  native:
+    name: Native library (arm64-v8a)
+    needs: host-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore NDK, SDK sources and CMake dependencies
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/ndk
+            ${{ runner.temp }}/preloader-android
+            ${{ runner.temp }}/fetchcontent
+          key: ndk-${{ env.NDK_VERSION }}-preloader-${{ env.PRELOADER_COMMIT }}
+
+      - name: Install NDK
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/ndk.zip" \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          mkdir -p "$RUNNER_TEMP/ndk"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP/ndk"
+          rm -f "$RUNNER_TEMP/ndk.zip"
+
+      - name: Fetch preloader SDK
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$PRELOADER_REPO" "$RUNNER_TEMP/preloader-android"
+          git -C "$RUNNER_TEMP/preloader-android" checkout "$PRELOADER_COMMIT"
+          mkdir -p "$RUNNER_TEMP/fetchcontent"
+          # The pin has been recorded by the checkout above; dropping .git keeps
+          # the cache small and stops the SDK's own history drifting into a run.
+          rm -rf "$RUNNER_TEMP/preloader-android/.git"
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          NDK="$RUNNER_TEMP/ndk/android-ndk-${NDK_VERSION}"
+          cmake -S . -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ANDROID_ABI" \
+            -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFPS_OPTO_PRO_BUILD_TESTS=OFF \
+            -DFETCHCONTENT_BASE_DIR="$RUNNER_TEMP/fetchcontent" \
+            -DPRELOADER_ANDROID_ROOT="$RUNNER_TEMP/preloader-android"
+
+      - name: Build
+        run: cmake --build build-android -j"$(nproc)"
+
+      - name: Verify the artifact
+        run: |
+          set -euo pipefail
+          SO="build-android/out/${ANDROID_ABI}/libfps_opto_pro.so"
+          test -f "$SO" || { echo "missing $SO"; exit 1; }
+
+          NDK="$RUNNER_TEMP/ndk/android-ndk-${NDK_VERSION}"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          # Read the table into a variable first. Piping straight into `grep -q`
+          # would let grep exit on the first match, SIGPIPE the reader, and fail
+          # this step under `set -o pipefail` even though the symbol is present.
+          SYMS="$("$READELF" --dyn-syms "$SO")"
+
+          # The preloader loads the mod by this one exported symbol. Without it
+          # the library installs cleanly and then does nothing at all.
+          if ! grep -q 'PLGetModRegistration' <<<"$SYMS"; then
+            echo "PLGetModRegistration is not exported"
+            exit 1
+          fi
+
+          echo "dynamic dependencies:"
+          "$READELF" -d "$SO" | grep NEEDED
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fps_opto_pro-lib-${{ env.ANDROID_ABI }}
+          path: build-android/out/${{ env.ANDROID_ABI }}/libfps_opto_pro.so
+          if-no-files-found: error

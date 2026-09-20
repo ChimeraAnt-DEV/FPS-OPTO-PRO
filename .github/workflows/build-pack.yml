@@ -1,0 +1,123 @@
+name: build-pack
+
+# Packages the mod into the archive format the launcher can actually import.
+#
+# The format is NOT a "levipack" -- there is no such thing in the launcher.
+# FileHandler.java treats a mod package as a .zip (or .chimerapack) and then
+# accepts it only if it satisfies all of:
+#   1. exactly one .so entry in the archive,
+#   2. a manifest.json at some directory root,
+#   3. that .so located under the same root as the manifest.
+# If any of those fail the launcher rejects the file with no useful error, so
+# the layout is validated here rather than discovered after distribution.
+#
+# manifest.json is placed at the archive root. The launcher also accepts the
+# manifest nested one directory (the "mods/<Name>/" shape it uses on disk), but
+# the root layout is the one this repository already ships and tests, so the
+# pack keeps it.
+#
+# This workflow is only needed if you want a distributable file. The launcher
+# also imports a mod as loose files in a directory, so a pack is a convenience
+# rather than a requirement.
+
+on:
+  # Deliberately not every push: build-so.yml already builds the library on
+  # each commit, and running this too would cross-compile the same artifact
+  # twice. A pack is a distribution artifact, so it is produced for a release
+  # tag or on demand. Add `push: branches: ['**']` below if you want one per
+  # commit instead.
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    # Reuses the build and its verification instead of building twice.
+    uses: ./.github/workflows/build-so.yml
+
+  pack:
+    name: Mod package
+    needs: native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the built library
+        uses: actions/download-artifact@v4
+        with:
+          name: fps_opto_pro-lib-arm64-v8a
+          path: stage
+
+      - name: Assemble the package
+        run: |
+          set -euo pipefail
+          rm -rf pack
+          mkdir -p pack
+          cp manifest.json pack/
+          cp stage/libfps_opto_pro.so pack/
+          ls -la pack
+
+      - name: Validate against the launcher's import rules
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys, zipfile, pathlib
+
+          name = json.loads(pathlib.Path("manifest.json").read_text())["name"]
+          archive = f"{name}.chimerapack"
+
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+              for f in sorted(pathlib.Path("pack").iterdir()):
+                  z.write(f, f.name)
+
+          # Re-implements FileHandler.isValidZipModPackage.
+          with zipfile.ZipFile(archive) as z:
+              names = [
+                  n.replace("\\", "/")
+                  for n in z.namelist()
+                  if not n.startswith("__MACOSX") and not n.endswith("/")
+              ]
+
+          manifests, sos = [], []
+          for n in names:
+              if n == "manifest.json" or n.endswith("/manifest.json"):
+                  manifests.append(n[: -len("manifest.json")].rstrip("/"))
+              if n.lower().endswith(".so"):
+                  sos.append(n)
+
+          def under(root, so):
+              return True if not root else so.startswith(root + "/")
+
+          print("entries:", names)
+          print("manifest roots:", manifests)
+          print("shared objects:", sos)
+
+          if not manifests:
+              sys.exit("no manifest.json in the archive")
+          if len(sos) != 1:
+              sys.exit(f"expected exactly one .so, found {len(sos)}")
+
+          valid = [r for r in manifests if under(r, sos[0])]
+          if len(valid) != 1:
+              sys.exit("the .so is not under exactly one manifest root")
+
+          print(f"OK: {archive} is importable")
+          pathlib.Path("archive_name.txt").write_text(archive)
+          PY
+
+      - name: Show the result
+        run: |
+          set -euo pipefail
+          ARCHIVE="$(cat archive_name.txt)"
+          sha256sum "$ARCHIVE"
+          ls -la "$ARCHIVE"
+
+      - name: Upload the mod package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fps-opto-pro-pack
+          path: ${{ github.workspace }}/*.chimerapack
+          if-no-files-found: error
