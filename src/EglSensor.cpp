@@ -44,9 +44,6 @@ PFNEGLGETCURRENTCONTEXTPROC gGetCurrentContext = nullptr;
 
 std::atomic<int> gProbeCountdown{kProbePeriodFrames};
 
-// The damage-swap entry point is an extension, so it is resolved at runtime.
-PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC gSwapWithDamage = nullptr;
-
 // The hook replaces the exported EGL symbol itself, so a detour that called the
 // symbol by name would re-enter its own detour forever. The trampolines the
 // hook API hands back are the only safe way through.
@@ -155,11 +152,11 @@ EGLBoolean fpsopto_eglSwapBuffersWithDamageKHR(EGLDisplay display,
                                                const EGLint *rects,
                                                EGLint nRects) {
   return doSwap([&]() -> EGLBoolean {
-    auto swap = gSwapWithDamage;
-    if (swap == nullptr) {
-      swap = reinterpret_cast<PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC>(
-          eglGetProcAddress("eglSwapBuffersWithDamageKHR"));
-    }
+    // The trampoline is the hooked symbol's own body, so it must be used here.
+    // eglGetProcAddress would return this detour again -- the export table is
+    // what was patched -- and calling it would recurse until the stack dies.
+    auto swap = reinterpret_cast<PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC>(
+        eglOriginal(kEglSwapBuffersWithDamage));
     if (swap == nullptr) {
       // The driver never provided the entry point, so behave exactly like a
       // plain swap rather than failing the present.
@@ -174,12 +171,6 @@ EGLBoolean fpsopto_eglSwapBuffersWithDamageKHR(EGLDisplay display,
   });
 }
 
-static void fpsopto_on_context_change() {
-  // A new or different context means every shadowed value is unknown again,
-  // and the freshly bound context starts at the specification's defaults.
-  GlInterceptor::instance().onContextChanged();
-}
-
 EGLContext fpsopto_eglCreateContext(EGLDisplay display, EGLConfig config,
                                     EGLContext shareContext,
                                     const EGLint *attribs) {
@@ -190,7 +181,12 @@ EGLContext fpsopto_eglCreateContext(EGLDisplay display, EGLConfig config,
   }
   const EGLContext created = create(display, config, shareContext, attribs);
   if (created != EGL_NO_CONTEXT) {
-    fpsopto_on_context_change();
+    // Registering the context (rather than resetting on the next make-current)
+    // gives it a shadow that starts at the spec defaults -- which is the only
+    // shadow this mod will filter against. A context created before the hooks
+    // is never registered, so its calls stay unfiltered.
+    GlInterceptor::instance().noteContextCreated(
+        reinterpret_cast<std::uintptr_t>(created));
   }
   return created;
 }
@@ -202,11 +198,10 @@ EGLBoolean fpsopto_eglMakeCurrent(EGLDisplay display, EGLSurface draw,
   if (makeCurrent == nullptr) {
     return EGL_FALSE;
   }
-  const EGLBoolean result = makeCurrent(display, draw, read, context);
-  if (result == EGL_TRUE) {
-    fpsopto_on_context_change();
-  }
-  return result;
+  // Nothing is reset here. The shadow belongs to the context and is looked up
+  // per call, so making a context current -- on any thread, including a loader
+  // thread -- cannot disturb another thread's state.
+  return makeCurrent(display, draw, read, context);
 }
 
 EGLBoolean fpsopto_eglDestroyContext(EGLDisplay display, EGLContext context) {
@@ -216,7 +211,8 @@ EGLBoolean fpsopto_eglDestroyContext(EGLDisplay display, EGLContext context) {
     return EGL_FALSE;
   }
   const EGLBoolean result = destroy(display, context);
-  fpsopto_on_context_change();
+  GlInterceptor::instance().noteContextDestroyed(
+      reinterpret_cast<std::uintptr_t>(context));
   return result;
 }
 
@@ -302,8 +298,6 @@ bool EglSensor::install(const std::string &moduleName) {
       eglGetProcAddress("eglGetCurrentDisplay"));
   gGetCurrentContext = reinterpret_cast<PFNEGLGETCURRENTCONTEXTPROC>(
       eglGetProcAddress("eglGetCurrentContext"));
-  gSwapWithDamage = reinterpret_cast<PFNEGLSWAPBUFFERSWITHDAMAGEKHRPROC>(
-      eglGetProcAddress("eglSwapBuffersWithDamageKHR"));
 
   mInstalled = mInstalledCount > 0;
   return mInstalled;

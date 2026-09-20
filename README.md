@@ -43,11 +43,16 @@ The correctness rules that make this safe:
 * The only capability the spec starts *enabled* is `GL_DITHER`; the shadow
   starts from exactly that, so a caller's `glEnable(GL_CULL_FACE)` is never
   dropped.
+* Object names are never trusted to prove a call redundant: driver names are
+  recycled when an object is deleted, so only a repeat unbind (name 0) is
+  dropped. `GL_ELEMENT_ARRAY_BUFFER` is not shadowed at all, because that
+  binding belongs to the current vertex-array object rather than the context.
 * Texture bindings are tracked per texture unit. A stale entry would make a
   pass sample the wrong image, so any target that cannot be addressed is always
   forwarded.
-* The shadow resets on a context change and only then, since state belongs to
-  the context and survives being made un-current.
+* The shadow is per context: every context created after the hooks has its own,
+  a context the mod never saw created is forwarded unfiltered, and making a
+  context current never resets another context's state.
 * Nothing touches swap interval, frame pacing, or the drawable.
 
 ## Install

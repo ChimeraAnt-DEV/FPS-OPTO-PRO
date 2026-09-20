@@ -8,15 +8,17 @@
 //
 // Correctness rules the model relies on:
 //   1. Context state is owned by the context, so a shadow survives being made
-//      un-current and current again. It is only reset when a *different*
-//      context becomes current, because a fresh context starts at the values
-//      returned by `freshContextState()` as defined by the GL ES spec.
+//      un-current and current again. It is per context, created at the spec
+//      defaults by `freshContextState()`, and is only ever exposed for a
+//      context the caller has registered as one this mod saw created.
 //   2. A field the spec does not pin down (viewport, program, object bindings,
 //      pixel-store values) starts at an impossible sentinel, so the first call
 //      of that kind is always issued and the shadow is learned from the real
 //      stream.
 //   3. Object names are non-zero wherever a name is required, which is what
-//      makes a sentinel of `kUnknownUint` safe.
+//      makes a sentinel of `kUnknownUint` safe. Because names are recycled on
+//      delete, a non-zero name is never enough to drop a call; see
+//      `canDropBinding`.
 
 #include <cstdint>
 #include <limits>
@@ -229,7 +231,9 @@ struct GlStateModel {
   std::uint32_t activeTexture = kGlTexture0;
 
   std::uint32_t arrayBuffer = kUnknownUint;
-  std::uint32_t elementArrayBuffer = kUnknownUint;
+  // GL_ELEMENT_ARRAY_BUFFER is deliberately absent: its binding is part of the
+  // vertex-array object rather than the context, so a context-level shadow
+  // cannot be kept correct. Those binds are always forwarded.
   std::uint32_t framebuffer = kUnknownUint;
   std::uint32_t vertexArray = kUnknownUint;
 
@@ -322,13 +326,20 @@ constexpr bool sameViewport(const GlStateModel &state, int x, int y, int w,
          state.viewportW == w && state.viewportH == h;
 }
 
-// Object names are compared exactly. The "unknown" sentinel is 0xFFFFFFFF, and
-// no driver hands out that name, so a shadow that has never been written can
-// never be mistaken for a real binding -- including the real binding 0, which
-// is what makes a repeated unbind or a repeated default-framebuffer bind
-// correctly recognised as redundant.
+// A binding can only ever be dropped when the call is an unbind (name 0) whose
+// shadow already says "unbound". A non-zero shadow proves nothing: object
+// names are recycled once the object is deleted, so the name the context holds
+// may no longer be the object that was bound, and a client that owns several
+// contexts can hold a binding outside this shadow entirely. The "unknown"
+// sentinel (0xFFFFFFFF, a name no driver issues) can therefore never be
+// mistaken for a real binding, while the real binding 0 -- the default
+// framebuffer, an unbind -- is correctly recognised as redundant on repeat.
 constexpr bool sameBinding(std::uint32_t shadow, std::uint32_t name) {
   return shadow == name;
+}
+
+constexpr bool canDropBinding(std::uint32_t shadow, std::uint32_t name) {
+  return name == 0 && sameBinding(shadow, name);
 }
 
 // The pixel-store functions take a signed value; the shadow keeps the exact

@@ -7,8 +7,11 @@
 // into references to exactly these probe functions, so the assertions below
 // observe the same stream a real driver would.
 
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -19,9 +22,13 @@ namespace {
 
 struct Trace {
   std::vector<std::string> calls;
-  void reset() { calls.clear(); }
+  void reset() {
+    std::lock_guard lock(mMutex);
+    calls.clear();
+  }
   bool empty() const { return calls.empty(); }
   std::size_t count(const char *name) const {
+    std::lock_guard lock(mMutex);
     std::size_t total = 0;
     for (const auto &call : calls) {
       if (call == name) {
@@ -30,11 +37,18 @@ struct Trace {
     }
     return total;
   }
+  void push(const char *name) {
+    std::lock_guard lock(mMutex);
+    calls.emplace_back(name);
+  }
+
+private:
+  mutable std::mutex mMutex;
 };
 
 Trace gTrace;
 
-void note(const char *name) { gTrace.calls.emplace_back(name); }
+void note(const char *name) { gTrace.push(name); }
 
 } // namespace
 
@@ -102,10 +116,26 @@ void fpsopto_glBlendEquationSeparate(unsigned int, unsigned int);
 
 namespace {
 
-void freshContext() {
-  fpsopto::GlInterceptor::instance().onContextChanged();
+// Each tracked context has its own shadow, so the tests register a fresh one
+// and make it current. The returned handle is used to prove that one thread's
+// context shadow is untouched by another thread making its own context current.
+std::uintptr_t gNextContext = 0;
+
+std::uintptr_t makeContext() {
+  const std::uintptr_t handle = ++gNextContext;
+  fpsopto::GlInterceptor::instance().noteContextCreated(handle);
+  fpsopto::GlInterceptor::instance().setCurrentContextForTest(handle);
+  gTrace.reset();
+  return handle;
+}
+
+// A context this mod never registered: it must be forwarded unfiltered.
+void makeUntrackedContext() {
+  fpsopto::GlInterceptor::instance().setCurrentContextForTest(++gNextContext);
   gTrace.reset();
 }
+
+void freshContext() { (void)makeContext(); }
 
 // A short name for the interposer instance the tests drive.
 fpsopto::GlInterceptor &gl() { return fpsopto::GlInterceptor::instance(); }
@@ -272,11 +302,23 @@ void repeatedCullFaceIsDropped() {
 // Object bindings
 // ---------------------------------------------------------------------------
 
-void repeatedProgramBindIsDropped() {
+// A non-zero name is never dropped. Names are recycled once an object is
+// deleted, so a matching shadow proves nothing about what the context holds.
+void repeatedProgramBindIsForwarded() {
   freshContext();
   fpsopto_glUseProgram(7);
   fpsopto_glUseProgram(7);
   fpsopto_glUseProgram(9);
+  EXPECT_EQ(gTrace.count("glUseProgram"), std::size_t{3});
+}
+
+// Unbinding a program that the shadow already knows is unbound is the one
+// binding call that is safe to drop.
+void repeatedProgramUnbindIsDropped() {
+  freshContext();
+  fpsopto_glUseProgram(7);
+  fpsopto_glUseProgram(0);
+  fpsopto_glUseProgram(0);
   EXPECT_EQ(gTrace.count("glUseProgram"), std::size_t{2});
 }
 
@@ -288,12 +330,22 @@ void firstProgramBindIsForwarded() {
   EXPECT_EQ(gTrace.count("glUseProgram"), std::size_t{1});
 }
 
-void repeatedBufferBindIsDropped() {
+// Every GL_ELEMENT_ARRAY_BUFFER bind is forwarded: its binding state lives in
+// the current vertex-array object, not the context, so it is never shadowed.
+// Only the repeat of an unbind on a context-level target may be dropped.
+void elementArrayBufferBindsAreAlwaysForwarded() {
+  freshContext();
+  fpsopto_glBindBuffer(fpsopto::kGlElementArrayBuffer, 12);
+  fpsopto_glBindBuffer(fpsopto::kGlElementArrayBuffer, 12);
+  fpsopto_glBindBuffer(fpsopto::kGlElementArrayBuffer, 0);
+  fpsopto_glBindBuffer(fpsopto::kGlElementArrayBuffer, 0);
+  EXPECT_EQ(gTrace.count("glBindBuffer"), std::size_t{4});
+}
+
+void nonZeroBufferBindIsForwardedEvenWhenRepeated() {
   freshContext();
   fpsopto_glBindBuffer(fpsopto::kGlArrayBuffer, 12);
   fpsopto_glBindBuffer(fpsopto::kGlArrayBuffer, 12);
-  fpsopto_glBindBuffer(fpsopto::kGlElementArrayBuffer, 12);
-  fpsopto_glBindBuffer(fpsopto::kGlElementArrayBuffer, 12);
   EXPECT_EQ(gTrace.count("glBindBuffer"), std::size_t{2});
 }
 
@@ -314,11 +366,13 @@ void firstUnbindIsStillForwarded() {
   EXPECT_EQ(gTrace.count("glBindBuffer"), std::size_t{1});
 }
 
-void repeatedFramebufferBindIsDropped() {
+// A non-zero framebuffer name is always forwarded, because the name can be
+// recycled by a later glGenFramebuffers and the shadow cannot see that.
+void repeatedFramebufferBindIsForwarded() {
   freshContext();
   fpsopto_glBindFramebuffer(fpsopto::kGlFramebuffer, 3);
   fpsopto_glBindFramebuffer(fpsopto::kGlFramebuffer, 3);
-  EXPECT_EQ(gTrace.count("glBindFramebuffer"), std::size_t{1});
+  EXPECT_EQ(gTrace.count("glBindFramebuffer"), std::size_t{2});
 }
 
 // Binding the default framebuffer twice is the common end-of-frame call and is
@@ -330,22 +384,54 @@ void repeatedDefaultFramebufferBindIsDropped() {
   EXPECT_EQ(gTrace.count("glBindFramebuffer"), std::size_t{1});
 }
 
-void repeatedVertexArrayBindIsDropped() {
+// A GL_READ_FRAMEBUFFER bind resets the draw-framebuffer shadow, because a
+// blit can pair the read binding with a draw binding the shadow still holds.
+void readFramebufferBindResetsDrawShadow() {
+  freshContext();
+  fpsopto_glBindFramebuffer(fpsopto::kGlFramebuffer, 0);
+  fpsopto_glBindFramebuffer(fpsopto::kGlFramebuffer, 0); // redundant
+  EXPECT_EQ(gTrace.count("glBindFramebuffer"), std::size_t{1});
+
+  // Binding a read framebuffer does not change the draw binding...
+  fpsopto_glBindFramebuffer(fpsopto::kGlReadFramebuffer, 7);
+  fpsopto_glBindFramebuffer(fpsopto::kGlReadFramebuffer, 7);
+  EXPECT_EQ(gTrace.count("glBindFramebuffer"), std::size_t{3});
+
+  // ...but it invalidates the draw shadow, so a draw bind that would otherwise
+  // look redundant must be issued again -- and only then is it redundant once
+  // more.
+  fpsopto_glBindFramebuffer(fpsopto::kGlFramebuffer, 0); // forced by the reset
+  EXPECT_EQ(gTrace.count("glBindFramebuffer"), std::size_t{4});
+  fpsopto_glBindFramebuffer(fpsopto::kGlFramebuffer, 0); // redundant again
+  EXPECT_EQ(gTrace.count("glBindFramebuffer"), std::size_t{4});
+}
+
+void nonZeroVertexArrayBindIsForwarded() {
   freshContext();
   fpsopto_glBindVertexArray(5);
   fpsopto_glBindVertexArray(5);
-  EXPECT_EQ(gTrace.count("glBindVertexArray"), std::size_t{1});
+  EXPECT_EQ(gTrace.count("glBindVertexArray"), std::size_t{2});
+}
+
+void repeatedVertexArrayUnbindIsDropped() {
+  freshContext();
+  fpsopto_glBindVertexArray(5);
+  fpsopto_glBindVertexArray(0);
+  fpsopto_glBindVertexArray(0);
+  EXPECT_EQ(gTrace.count("glBindVertexArray"), std::size_t{2});
 }
 
 // ---------------------------------------------------------------------------
 // Texture bindings, which are per unit
 // ---------------------------------------------------------------------------
 
-void repeatedTextureBindSameUnitIsDropped() {
+// A repeat of the same non-zero texture name is forwarded as well: the name may
+// have been deleted and recycled since the shadow recorded it.
+void repeatedTextureBindSameUnitIsForwarded() {
   freshContext();
   fpsopto_glBindTexture(fpsopto::kGlTexture2d, 10);
   fpsopto_glBindTexture(fpsopto::kGlTexture2d, 10);
-  EXPECT_EQ(gTrace.count("glBindTexture"), std::size_t{1});
+  EXPECT_EQ(gTrace.count("glBindTexture"), std::size_t{2});
 }
 
 // The scenario that makes per-unit tracking necessary: the same texture name
@@ -366,11 +452,13 @@ void differentTexturesOnSameUnitAreForwarded() {
   EXPECT_EQ(gTrace.count("glBindTexture"), std::size_t{2});
 }
 
+// A cube face target addresses the same slot as the cube map target, so a
+// repeated non-zero bind is forwarded exactly like any other.
 void cubeMapFacesAndTargetShareTheCubeSlot() {
   freshContext();
   fpsopto_glBindTexture(fpsopto::kGlTextureCubeMap, 20);
   fpsopto_glBindTexture(fpsopto::kGlTextureCubeMapPositiveX, 20);
-  EXPECT_EQ(gTrace.count("glBindTexture"), std::size_t{1});
+  EXPECT_EQ(gTrace.count("glBindTexture"), std::size_t{2});
 }
 
 // Binding texture 0 is a real unbind, so the transition to it is forwarded and
@@ -442,18 +530,91 @@ void contextResetRestoresSpecDefaults() {
   EXPECT_EQ(gTrace.count("glDisable"), std::size_t{1});
 }
 
-// A context change must forget the texture bindings: a fresh context inherits
-// none, so the same name has to be issued again rather than being assumed.
-void contextResetForgetsTextureBindings() {
-  freshContext();
-  fpsopto_glBindTexture(fpsopto::kGlTexture2d, 10);
-  fpsopto_glBindTexture(fpsopto::kGlTexture2d, 10); // redundant
-  EXPECT_EQ(gTrace.count("glBindTexture"), std::size_t{1});
+// A new context gets its own shadow. Setting state in one context must not
+// make the same call redundant in a different context.
+void contextsHaveIndependentShadows() {
+  const std::uintptr_t first = makeContext();
+  fpsopto_glEnable(fpsopto::kGlBlend);
+  fpsopto_glEnable(fpsopto::kGlBlend); // redundant here
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{1});
 
-  freshContext();
-  fpsopto_glBindTexture(fpsopto::kGlTexture2d, 10); // must be issued again
-  fpsopto_glBindTexture(fpsopto::kGlTexture2d, 10); // redundant again
-  EXPECT_EQ(gTrace.count("glBindTexture"), std::size_t{1});
+  makeContext();
+  fpsopto_glEnable(fpsopto::kGlBlend); // real again in the new context
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{1});
+
+  // Going back to the first context keeps its state: the capability is already
+  // on there, so the call is redundant.
+  fpsopto::GlInterceptor::instance().setCurrentContextForTest(first);
+  gTrace.reset();
+  fpsopto_glEnable(fpsopto::kGlBlend);
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{0});
+}
+
+// A context this mod never saw created must be forwarded unfiltered: its real
+// state is unknown, so no call against it can be assumed redundant.
+void untrackedContextIsForwardedUnfiltered() {
+  makeUntrackedContext();
+  fpsopto_glEnable(fpsopto::kGlBlend);
+  fpsopto_glEnable(fpsopto::kGlBlend);
+  fpsopto_glDisable(fpsopto::kGlBlend);
+  fpsopto_glViewport(0, 0, 1, 1);
+  fpsopto_glViewport(0, 0, 1, 1);
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{2});
+  EXPECT_EQ(gTrace.count("glDisable"), std::size_t{1});
+  EXPECT_EQ(gTrace.count("glViewport"), std::size_t{2});
+}
+
+// Destroying a context drops its shadow, so a handle reused afterwards starts
+// fresh rather than inheriting the destroyed context's state.
+void destroyedContextShadowIsDropped() {
+  const std::uintptr_t handle = makeContext();
+  fpsopto_glEnable(fpsopto::kGlBlend);
+  fpsopto_glEnable(fpsopto::kGlBlend); // redundant
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{1});
+
+  fpsopto::GlInterceptor::instance().noteContextDestroyed(handle);
+  fpsopto::GlInterceptor::instance().noteContextCreated(handle);
+  fpsopto::GlInterceptor::instance().setCurrentContextForTest(handle);
+  gTrace.reset();
+  fpsopto_glEnable(fpsopto::kGlBlend); // real again in the recreated context
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{1});
+}
+
+// Two rendering threads with different current contexts must not corrupt each
+// other's shadow, which is what made the old single global copy unsafe when a
+// loader thread made its context current. The loader leaves its own context
+// with blending disabled; if the shadow were shared, the render thread's
+// enable would be seen as a real change instead of a redundant one.
+void threadShadowsAreIsolated() {
+  const std::uintptr_t renderContext = makeContext();
+  fpsopto_glEnable(fpsopto::kGlBlend); // render thread's context: blend on
+
+  std::thread loader([]() {
+    const std::uintptr_t loaderContext = 0x1000;
+    fpsopto::GlInterceptor::instance().noteContextCreated(loaderContext);
+    fpsopto::GlInterceptor::instance().setCurrentContextForTest(loaderContext);
+    for (int i = 0; i < 1000; ++i) {
+      fpsopto_glDisable(fpsopto::kGlBlend);
+      fpsopto_glEnable(fpsopto::kGlBlend);
+    }
+    fpsopto_glDisable(fpsopto::kGlBlend); // ends with its own shadow "off"
+  });
+  loader.join();
+
+  // The render thread's context is untouched: blend is still shadowed as on, so
+  // re-enabling it is redundant and must not reach the driver.
+  gTrace.reset();
+  fpsopto_glEnable(fpsopto::kGlBlend);
+  EXPECT_EQ(gTrace.count("glEnable"), std::size_t{0});
+
+  // ...and the loader's own context remembers its own state.
+  fpsopto::GlInterceptor::instance().setCurrentContextForTest(0x1000);
+  gTrace.reset();
+  fpsopto_glDisable(fpsopto::kGlBlend); // already off there: redundant
+  EXPECT_EQ(gTrace.count("glDisable"), std::size_t{0});
+
+  fpsopto::GlInterceptor::instance().setCurrentContextForTest(renderContext);
+  fpsopto::GlInterceptor::instance().noteContextDestroyed(0x1000);
 }
 
 // ---------------------------------------------------------------------------
@@ -491,15 +652,19 @@ void runGlFilterTests() {
   nonZeroDepthMaskIsNormalisedToOne();
   repeatedColorMaskIsDropped();
   repeatedCullFaceIsDropped();
-  repeatedProgramBindIsDropped();
+  repeatedProgramBindIsForwarded();
+  repeatedProgramUnbindIsDropped();
   firstProgramBindIsForwarded();
-  repeatedBufferBindIsDropped();
+  elementArrayBufferBindsAreAlwaysForwarded();
+  nonZeroBufferBindIsForwardedEvenWhenRepeated();
   repeatedUnbindIsDropped();
   firstUnbindIsStillForwarded();
-  repeatedFramebufferBindIsDropped();
+  repeatedFramebufferBindIsForwarded();
   repeatedDefaultFramebufferBindIsDropped();
-  repeatedVertexArrayBindIsDropped();
-  repeatedTextureBindSameUnitIsDropped();
+  readFramebufferBindResetsDrawShadow();
+  nonZeroVertexArrayBindIsForwarded();
+  repeatedVertexArrayUnbindIsDropped();
+  repeatedTextureBindSameUnitIsForwarded();
   sameTextureOnDifferentUnitsIsNotRedundant();
   differentTexturesOnSameUnitAreForwarded();
   cubeMapFacesAndTargetShareTheCubeSlot();
@@ -509,6 +674,9 @@ void runGlFilterTests() {
   repeatedPixelStoreIsDropped();
   unknownPixelStorePnameIsForwarded();
   contextResetRestoresSpecDefaults();
-  contextResetForgetsTextureBindings();
+  contextsHaveIndependentShadows();
+  untrackedContextIsForwardedUnfiltered();
+  destroyedContextShadowIsDropped();
+  threadShadowsAreIsolated();
   statisticsCountSuppressions();
 }

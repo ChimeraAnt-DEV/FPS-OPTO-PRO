@@ -40,16 +40,24 @@ Output: `build-android/out/arm64-v8a/libfps_opto_pro.so`.
    own detour recurses forever. Always call through the stored original:
    `FPSOPTO_ORIGINAL(kEntryX, glX)` / `eglOriginal(kEglX)`. Grep for bare
    hooked-symbol calls as a regression check.
-2. **GL ES initial state.** The only capability enabled at context creation is
+2. **Never call `eglGetProcAddress` for a symbol you hooked** — it returns the
+   detour itself. Resolve helpers through `dlsym`, or store the trampoline.
+3. **GL ES initial state.** The only capability enabled at context creation is
    `GL_DITHER`. `GL_CULL_FACE` starts **disabled**. Getting this wrong drops a
    real `glEnable` and changes what is drawn.
-3. **Unknowable defaults use sentinels.** Values the spec does not pin down
+4. **Unknowable defaults use sentinels.** Values the spec does not pin down
    (viewport, program, object bindings, pixel-store) start at an impossible
    sentinel so the first call is always forwarded.
-4. **Texture bindings are per-unit.** Never share across units; forward any
+5. **Object names are never trusted.** Textures, buffers, framebuffers, VAOs and
+   programs have their names recycled on delete, so a non-zero shadow proves
+   nothing. Only a repeat **unbind** (name 0) may be dropped. `GL_ELEMENT_ARRAY_BUFFER`
+   is not shadowed at all — its binding belongs to the current VAO.
+6. **Texture bindings are per-unit.** Never share across units; forward any
    target that cannot be addressed.
-5. **Shadow resets on context change only.**
-6. **Never touch swap interval, pacing, or the drawable.**
+7. **The shadow is per context, not per process or per thread.** Keyed on the
+   EGL context handle from `eglCreateContext`; a context the mod never saw
+   created is forwarded unfiltered. `eglMakeCurrent` must not reset anything.
+8. **Never touch swap interval, pacing, or the drawable.**
 
 ## ChimeraLauncher / preloader contracts
 
