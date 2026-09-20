@@ -9,7 +9,10 @@ add_executable(fps_opto_pro_tests
     test_gl_filter.cpp
     test_governor.cpp
     test_telemetry.cpp
-    ../src/GlInterceptor.cpp)
+    test_policy.cpp
+    ../src/GlInterceptor.cpp
+    ../src/Diagnostics.cpp
+    ../src/BootMarker.cpp)
 
 target_include_directories(fps_opto_pro_tests PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../src")

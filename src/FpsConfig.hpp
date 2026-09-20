@@ -23,6 +23,15 @@ struct FpsConfig {
   bool enableEglSensor = true;
   bool enableScheduler = true;
 
+  // See the measured frame time and filter effectiveness on screen. Off by
+  // default: an overlay is a visible change, and the default has to be "the
+  // mod does nothing you can see".
+  bool showOverlay = false;
+
+  // Let the mod shed the levers that are not paying for themselves. See
+  // AutoPolicy.h for what that means.
+  bool autoMode = true;
+
   bool logStats = false;
   int logIntervalSeconds = 30;
 
@@ -76,6 +85,20 @@ template <> struct Schema<fpsopto::FpsConfig> {
       return {"Live frame sensor",
               "Measure frame interval and GPU workloads at the swap boundary "
               "to drive the scheduler. Read-only.",
+              std::nullopt, std::nullopt, false};
+    }
+    if (name == "showOverlay") {
+      return {"Show diagnostics overlay",
+              "Draw the measured frame time, CPU/GPU split and GL drop rate "
+              "on screen. Diagnostic only; drawing the numbers is the one "
+              "visible thing this mod does.",
+              std::nullopt, std::nullopt, false};
+    }
+    if (name == "autoMode") {
+      return {"Automatic mode",
+              "Switch off the levers that are not earning their keep: on a "
+              "GPU-bound frame the CPU-side work cannot help, and a filter "
+              "hook dropping almost nothing costs more than it saves.",
               std::nullopt, std::nullopt, false};
     }
     if (name == "enableScheduler") {

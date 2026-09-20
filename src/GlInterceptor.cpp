@@ -59,13 +59,25 @@ static inline void fpsoptoLog(const char *) {}
 namespace fpsopto {
 namespace {
 
-void record(bool suppressed) {
-  GlInterceptor::instance().noteCall(suppressed);
+void record(GlHook hook, bool suppressed) {
+  GlInterceptor::instance().noteCall(hook, suppressed);
 }
 
-// Convenience wrapper. `self.shadow()` is null for a context this mod must not
-// filter, and every detour then forwards the call untouched.
+// The shadow to filter a call against, or null for a context this mod never saw
+// created, whose real state is therefore unknown; that detour then forwards
+// everything untouched.
+//
+// A hook that has been switched off still gets its shadow here, and still
+// updates it. The fields one hook maintains are read by others -- glBindTexture
+// reads the active-texture shadow, for one -- so a disabled hook that stopped
+// learning would corrupt the drops the remaining hooks make. Switching a hook
+// off only stops it from dropping; it never stops it from learning. What that
+// costs is the shadow comparison, which is the cheap half of the work, so the
+// saving is smaller than it looks and the correctness is worth more.
 GlStateModel *stateOf(GlInterceptor &self) { return self.shadow().state; }
+
+// Whether this hook is currently allowed to drop a call it recognises.
+bool mayDrop(GlInterceptor &self, GlHook hook) { return self.hookEnabled(hook); }
 
 // The hook replaces the exported symbol itself, so a detour that called the
 // symbol by name would re-enter its own detour forever. The trampoline the
@@ -128,11 +140,12 @@ void fpsopto_glEnable(unsigned int capability) {
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
   const std::uint32_t bit = capabilityBit(capability);
-  if (tracked && bit != 0 && (state->enabled & bit) != 0) {
-    record(true);
+  if (tracked && bit != 0 && (state->enabled & bit) != 0 &&
+      mayDrop(self, GlHook::Enable)) {
+    record(GlHook::Enable, true);
     return;
   }
-  record(false);
+  record(GlHook::Enable, false);
   if (tracked && bit != 0) {
     state->enabled |= bit;
   }
@@ -144,11 +157,12 @@ void fpsopto_glDisable(unsigned int capability) {
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
   const std::uint32_t bit = capabilityBit(capability);
-  if (tracked && bit != 0 && (state->enabled & bit) == 0) {
-    record(true);
+  if (tracked && bit != 0 && (state->enabled & bit) == 0 &&
+      mayDrop(self, GlHook::Disable)) {
+    record(GlHook::Disable, true);
     return;
   }
-  record(false);
+  record(GlHook::Disable, false);
   if (tracked && bit != 0) {
     state->enabled &= ~bit;
   }
@@ -159,11 +173,12 @@ void fpsopto_glBlendFunc(unsigned int src, unsigned int dst) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && sameBlend(*state, src, dst, src, dst)) {
-    record(true);
+  if (tracked && sameBlend(*state, src, dst, src, dst) &&
+      mayDrop(self, GlHook::BlendFunc)) {
+    record(GlHook::BlendFunc, true);
     return;
   }
-  record(false);
+  record(GlHook::BlendFunc, false);
   if (tracked) {
     state->blendSrcRgb = src;
     state->blendDstRgb = dst;
@@ -178,11 +193,12 @@ void fpsopto_glBlendFuncSeparate(unsigned int srcRgb, unsigned int dstRgb,
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && sameBlend(*state, srcRgb, dstRgb, srcAlpha, dstAlpha)) {
-    record(true);
+  if (tracked && sameBlend(*state, srcRgb, dstRgb, srcAlpha, dstAlpha) &&
+      mayDrop(self, GlHook::BlendFuncSeparate)) {
+    record(GlHook::BlendFuncSeparate, true);
     return;
   }
-  record(false);
+  record(GlHook::BlendFuncSeparate, false);
   if (tracked) {
     state->blendSrcRgb = srcRgb;
     state->blendDstRgb = dstRgb;
@@ -196,12 +212,12 @@ void fpsopto_glBlendEquation(unsigned int mode) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && state->blendEquationRgb == mode &&
-      state->blendEquationAlpha == mode) {
-    record(true);
+  if ((tracked && state->blendEquationRgb == mode &&
+      state->blendEquationAlpha == mode) && mayDrop(self, GlHook::BlendEquation)) {
+    record(GlHook::BlendEquation, true);
     return;
   }
-  record(false);
+  record(GlHook::BlendEquation, false);
   if (tracked) {
     state->blendEquationRgb = mode;
     state->blendEquationAlpha = mode;
@@ -213,12 +229,12 @@ void fpsopto_glBlendEquationSeparate(unsigned int rgb, unsigned int alpha) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && state->blendEquationRgb == rgb &&
-      state->blendEquationAlpha == alpha) {
-    record(true);
+  if ((tracked && state->blendEquationRgb == rgb &&
+      state->blendEquationAlpha == alpha) && mayDrop(self, GlHook::BlendEquationSeparate)) {
+    record(GlHook::BlendEquationSeparate, true);
     return;
   }
-  record(false);
+  record(GlHook::BlendEquationSeparate, false);
   if (tracked) {
     state->blendEquationRgb = rgb;
     state->blendEquationAlpha = alpha;
@@ -230,11 +246,12 @@ void fpsopto_glBlendColor(float r, float g, float b, float a) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && sameBlendColor(*state, r, g, b, a)) {
-    record(true);
+  if (tracked && sameBlendColor(*state, r, g, b, a) &&
+      mayDrop(self, GlHook::BlendColor)) {
+    record(GlHook::BlendColor, true);
     return;
   }
-  record(false);
+  record(GlHook::BlendColor, false);
   if (tracked) {
     state->blendColorR = r;
     state->blendColorG = g;
@@ -248,11 +265,12 @@ void fpsopto_glDepthFunc(unsigned int func) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && state->depthFunc == func) {
-    record(true);
+  if (tracked && state->depthFunc == func &&
+      mayDrop(self, GlHook::DepthFunc)) {
+    record(GlHook::DepthFunc, true);
     return;
   }
-  record(false);
+  record(GlHook::DepthFunc, false);
   if (tracked) {
     state->depthFunc = func;
   }
@@ -264,11 +282,12 @@ void fpsopto_glDepthMask(unsigned char flag) {
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
   const std::uint8_t normalized = flag ? 1 : 0;
-  if (tracked && state->depthMask == normalized) {
-    record(true);
+  if (tracked && state->depthMask == normalized &&
+      mayDrop(self, GlHook::DepthMask)) {
+    record(GlHook::DepthMask, true);
     return;
   }
-  record(false);
+  record(GlHook::DepthMask, false);
   if (tracked) {
     state->depthMask = normalized;
   }
@@ -284,11 +303,12 @@ void fpsopto_glColorMask(unsigned char r, unsigned char g, unsigned char b,
   const std::uint32_t ng = g ? 1u : 0u;
   const std::uint32_t nb = b ? 1u : 0u;
   const std::uint32_t na = a ? 1u : 0u;
-  if (tracked && sameColorMask(*state, nr, ng, nb, na)) {
-    record(true);
+  if (tracked && sameColorMask(*state, nr, ng, nb, na) &&
+      mayDrop(self, GlHook::ColorMask)) {
+    record(GlHook::ColorMask, true);
     return;
   }
-  record(false);
+  record(GlHook::ColorMask, false);
   if (tracked) {
     state->colorMaskR = nr;
     state->colorMaskG = ng;
@@ -302,11 +322,12 @@ void fpsopto_glCullFace(unsigned int mode) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && state->cullFaceMode == mode) {
-    record(true);
+  if (tracked && state->cullFaceMode == mode &&
+      mayDrop(self, GlHook::CullFace)) {
+    record(GlHook::CullFace, true);
     return;
   }
-  record(false);
+  record(GlHook::CullFace, false);
   if (tracked) {
     state->cullFaceMode = mode;
   }
@@ -317,11 +338,12 @@ void fpsopto_glFrontFace(unsigned int mode) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && state->frontFace == mode) {
-    record(true);
+  if (tracked && state->frontFace == mode &&
+      mayDrop(self, GlHook::FrontFace)) {
+    record(GlHook::FrontFace, true);
     return;
   }
-  record(false);
+  record(GlHook::FrontFace, false);
   if (tracked) {
     state->frontFace = mode;
   }
@@ -332,11 +354,12 @@ void fpsopto_glDepthRangef(float near, float far) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && sameDepthRange(*state, near, far)) {
-    record(true);
+  if (tracked && sameDepthRange(*state, near, far) &&
+      mayDrop(self, GlHook::DepthRangef)) {
+    record(GlHook::DepthRangef, true);
     return;
   }
-  record(false);
+  record(GlHook::DepthRangef, false);
   if (tracked) {
     state->depthRangeNear = near;
     state->depthRangeFar = far;
@@ -349,11 +372,12 @@ void fpsopto_glSampleCoverage(float value, unsigned char invert) {
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
   const std::uint8_t normalized = invert ? 1 : 0;
-  if (tracked && sameSampleCoverage(*state, value, normalized)) {
-    record(true);
+  if (tracked && sameSampleCoverage(*state, value, normalized) &&
+      mayDrop(self, GlHook::SampleCoverage)) {
+    record(GlHook::SampleCoverage, true);
     return;
   }
-  record(false);
+  record(GlHook::SampleCoverage, false);
   if (tracked) {
     state->sampleCoverageValue = value;
     state->sampleCoverageInvert = normalized;
@@ -365,11 +389,12 @@ void fpsopto_glViewport(int x, int y, int w, int h) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && sameViewport(*state, x, y, w, h)) {
-    record(true);
+  if (tracked && sameViewport(*state, x, y, w, h) &&
+      mayDrop(self, GlHook::Viewport)) {
+    record(GlHook::Viewport, true);
     return;
   }
-  record(false);
+  record(GlHook::Viewport, false);
   if (tracked) {
     state->viewportX = x;
     state->viewportY = y;
@@ -383,11 +408,12 @@ void fpsopto_glUseProgram(unsigned int program) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && canDropBinding(state->currentProgram, program)) {
-    record(true);
+  if (tracked && canDropBinding(state->currentProgram, program) &&
+      mayDrop(self, GlHook::UseProgram)) {
+    record(GlHook::UseProgram, true);
     return;
   }
-  record(false);
+  record(GlHook::UseProgram, false);
   if (tracked) {
     state->currentProgram = program;
   }
@@ -398,11 +424,12 @@ void fpsopto_glActiveTexture(unsigned int texture) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && state->activeTexture == texture) {
-    record(true);
+  if (tracked && state->activeTexture == texture &&
+      mayDrop(self, GlHook::ActiveTexture)) {
+    record(GlHook::ActiveTexture, true);
     return;
   }
-  record(false);
+  record(GlHook::ActiveTexture, false);
   if (tracked) {
     state->activeTexture = texture;
   }
@@ -427,11 +454,12 @@ void fpsopto_glBindBuffer(unsigned int target, unsigned int buffer) {
   // mod does not filter forwards everything, so an untracked target only ever
   // reaches the driver.
 
-  if (shadow != nullptr && canDropBinding(*shadow, buffer)) {
-    record(true);
+  if (shadow != nullptr && canDropBinding(*shadow, buffer) &&
+      mayDrop(self, GlHook::BindBuffer)) {
+    record(GlHook::BindBuffer, true);
     return;
   }
-  record(false);
+  record(GlHook::BindBuffer, false);
   if (shadow != nullptr) {
     *shadow = buffer;
   }
@@ -452,17 +480,18 @@ void fpsopto_glBindTexture(unsigned int target, unsigned int texture) {
   // target is always forwarded.
   if (tracked) {
     std::uint32_t &shadow = textures->textures[unitIndex][slot];
-    if (canDropBinding(shadow, texture)) {
-      record(true);
+    if (canDropBinding(shadow, texture) &&
+      mayDrop(self, GlHook::BindTexture)) {
+      record(GlHook::BindTexture, true);
       return;
     }
-    record(false);
+    record(GlHook::BindTexture, false);
     shadow = texture;
     FPSOPTO_ORIGINAL(kEntryBindTexture, glBindTexture)(target, texture);
     return;
   }
 
-  record(false);
+  record(GlHook::BindTexture, false);
   FPSOPTO_ORIGINAL(kEntryBindTexture, glBindTexture)(target, texture);
 }
 
@@ -470,11 +499,12 @@ void fpsopto_glBindFramebuffer(unsigned int target, unsigned int framebuffer) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool draw = target == kGlFramebuffer || target == kGlDrawFramebuffer;
-  if (state != nullptr && draw && canDropBinding(state->framebuffer, framebuffer)) {
-    record(true);
+  if (state != nullptr && draw && canDropBinding(state->framebuffer, framebuffer) &&
+      mayDrop(self, GlHook::BindFramebuffer)) {
+    record(GlHook::BindFramebuffer, true);
     return;
   }
-  record(false);
+  record(GlHook::BindFramebuffer, false);
   if (draw) {
     if (state != nullptr) {
       state->framebuffer = framebuffer;
@@ -494,11 +524,12 @@ void fpsopto_glBindVertexArray(unsigned int array) {
   auto &self = GlInterceptor::instance();
   GlStateModel *state = stateOf(self);
   const bool tracked = state != nullptr;
-  if (tracked && canDropBinding(state->vertexArray, array)) {
-    record(true);
+  if (tracked && canDropBinding(state->vertexArray, array) &&
+      mayDrop(self, GlHook::BindVertexArray)) {
+    record(GlHook::BindVertexArray, true);
     return;
   }
-  record(false);
+  record(GlHook::BindVertexArray, false);
   if (tracked) {
     state->vertexArray = array;
   }
@@ -519,11 +550,12 @@ void fpsopto_glPixelStorei(unsigned int pname, int param) {
     }
   }
 
-  if (shadow != nullptr && samePixelStore(*shadow, param)) {
-    record(true);
+  if (shadow != nullptr && samePixelStore(*shadow, param) &&
+      mayDrop(self, GlHook::PixelStorei)) {
+    record(GlHook::PixelStorei, true);
     return;
   }
-  record(false);
+  record(GlHook::PixelStorei, false);
   if (shadow != nullptr) {
     *shadow = static_cast<std::uint32_t>(param);
   }
@@ -572,13 +604,6 @@ std::uintptr_t queryCurrentContext() {
 
 } // namespace
 #endif
-
-void GlInterceptor::noteCall(bool suppressed) {
-  mStateCalls.fetch_add(1, std::memory_order_relaxed);
-  if (suppressed) {
-    mSuppressed.fetch_add(1, std::memory_order_relaxed);
-  }
-}
 
 GlInterceptor::LiveShadow GlInterceptor::shadow() {
   const std::uintptr_t handle = currentContext();
@@ -654,6 +679,8 @@ void GlInterceptor::noteContextDestroyed(std::uintptr_t context) {
   }
 }
 
+const GlStateModel *GlInterceptor::shadowStateForTest() { return shadow().state; }
+
 void GlInterceptor::setCurrentContextForTest(std::uintptr_t context) {
   // The test build has no EGL query, so the handle is held per thread. This is
   // what lets a test put two threads on two contexts at once.
@@ -704,6 +731,10 @@ bool GlInterceptor::install(const std::string &moduleName) {
   // context the mod never saw (one that existed before the hooks) is forwarded
   // unfiltered until then.
 
+  // Every hook starts enabled. The auto mode switches them off after install,
+  // which keeps the install path free of policy.
+  setAllHooksEnabled(true);
+
   setCurrentContextQuery(&queryCurrentContext);
 
   for (const auto &spec : specs) {
@@ -746,6 +777,7 @@ void GlInterceptor::uninstall() {
 
 bool GlInterceptor::install(const std::string &) {
   mInstalled = true;
+  setAllHooksEnabled(true);
   return true;
 }
 

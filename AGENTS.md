@@ -11,6 +11,15 @@ holding 30-60 FPS with **zero** visual change. Every lever is timing-only.
 ## Layout
 
 - `src/` — mod sources. `FpsOptoPro.cpp` is the lifecycle/ModMenu entry.
+  - `GlInterceptor.*` / `GlStateModel.h` — GL filter and its per-context shadow.
+  - `GlCounters.h` — per-thread-batched, per-hook filter counters.
+  - `EglSensor.*` / `FrameTelemetry.h` / `FrameGovernor.h` / `ThreadScheduler.*`
+    — frame timing and the advisory render-thread policy.
+  - `AutoPolicy.h` — auto mode: shed CPU-side levers when GPU-bound, and
+    disable hooks whose drop rate does not pay for their indirection.
+  - `BootGuard.h` / `BootMarker.*` — crash-loop guard (marker file across
+    launches; unproven launch starts with every hook inert).
+  - `Diagnostics.*` — the overlay/log snapshot.
 - `tests/` — host-only tests (no Android SDK, no NDK needed).
 - `manifest.json` — launcher contract: `"type": "preload-native"`, `"entry": "libfps_opto_pro.so"`.
 
@@ -32,6 +41,15 @@ cmake -S . -B build-android -G Ninja \
 cmake --build build-android
 ```
 Output: `build-android/out/arm64-v8a/libfps_opto_pro.so`.
+
+`src/FpsOptoPro.cpp`, `src/GlInterceptor.cpp` and `src/EglSensor.cpp` need the
+SDK, JNI, EGL/GLES and fmt headers, so they are not part of the host test
+build. To catch syntax errors in them quickly, run a header-only check with
+stub `jni.h`/`android/log.h`/`EGL`/`GLES2` headers plus the real `pl/`, json,
+pfr, magic_enum and fmt include roots:
+```
+g++ -std=c++20 -fsyntax-only -I src -I <sdk>/include -I <stubs> ... <file>.cpp
+```
 
 ## Critical invariants (do not break)
 
